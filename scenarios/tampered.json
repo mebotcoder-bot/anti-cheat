@@ -1,0 +1,18 @@
+{
+  "_desc": "Cheating box: custom kernel, tainted, Secure Boot off, injected .so, cheat driver, debugger attached.",
+  "kernel": {
+    "release": "6.8.0-45-cheat",
+    "base_version": "6.8.0",
+    "abi": 45,
+    "flavour": "cheat",
+    "flavour_official": false
+  },
+  "signals": {
+    "taint":       {"available": true, "value": 512, "clean": false},
+    "secure_boot": {"available": true, "enabled": false},
+    "modules":     {"available": true, "loaded": ["ext4", "memflow", "nvme"], "count": 3},
+    "dev_mem":     {"available": true, "exposed": ["/dev/mem", "/dev/kmem"]},
+    "ld_preload":  {"available": true, "ld_preload": "/tmp/aimbot.so", "ld_library_path": ""},
+    "debugger":    {"available": true, "tracer_pid": 1337, "clean": false}
+  }
+}

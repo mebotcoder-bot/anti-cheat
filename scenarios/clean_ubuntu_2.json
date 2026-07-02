@@ -1,0 +1,18 @@
+{
+  "_desc": "Clean Ubuntu box one ABI ahead (6.8.0-48) - exercises the >= rule.",
+  "kernel": {
+    "release": "6.8.0-48-generic",
+    "base_version": "6.8.0",
+    "abi": 48,
+    "flavour": "generic",
+    "flavour_official": true
+  },
+  "signals": {
+    "taint":       {"available": true, "value": 0, "clean": true},
+    "secure_boot": {"available": true, "enabled": true},
+    "modules":     {"available": true, "loaded": ["ext4", "nvme", "iwlwifi"], "count": 3},
+    "dev_mem":     {"available": true, "exposed": []},
+    "ld_preload":  {"available": true, "ld_preload": "", "ld_library_path": ""},
+    "debugger":    {"available": true, "tracer_pid": 0, "clean": true}
+  }
+}

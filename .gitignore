@@ -1,0 +1,12 @@
+# agent identity keys (per-machine secrets; never commit)
+state/*.pem
+
+# python / build artifacts
+__pycache__/
+*.pyc
+client/kmod/*.o
+client/kmod/*.ko
+client/kmod/*.mod*
+client/kmod/.*.cmd
+client/kmod/Module.symvers
+client/kmod/modules.order
