@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Anti-cheat attestation server — the trust authority.
+Anti-cheat attestation server — the trust authority + certificate authority.
 
 Endpoints (JSON POST):
-  /enroll  {client_id, pubkey_pem}      -> {ok}          (TOFU registration)
-  /nonce   {client_id}                  -> {nonce, ttl}  (fresh, single-use)
-  /attest  {report, signature}          -> Verdict       (verify + score)
+  /enroll  {client_id, csr_pem}        -> {cert_pem, ca_pem}   (CA issues client cert)
+  /nonce   {client_id}                 -> {nonce, ttl}         (fresh, single-use)
+  /attest  {report, signature, cert_pem} -> {verdict_obj, verdict_sig}
 
-State is in-memory (enrollments + outstanding nonces). Swap for a real datastore
-in production. Nonces are single-use and time-limited to stop replay of a good
-report captured earlier.
+The server holds a CA (root key + cert). Clients enroll by CSR and receive a
+cert chained to that CA. Attestations are verified against the cert; the server
+signs its verdict with the CA key so clients can authenticate the response.
+State (CA, nonces) is in-memory/on-disk for the demo; use a real datastore and
+an HSM-protected CA key in production.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -20,13 +23,57 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from protocol import Verdict, canonical_bytes  # noqa: E402
 from server import verifier  # noqa: E402
+from crypto import keys, pki  # noqa: E402
 
 NONCE_TTL = 30  # seconds
+_STATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
 
-_ENROLLED: dict[str, str] = {}          # client_id -> public key PEM (TOFU)
-_NONCES: dict[str, tuple[str, float]] = {}  # nonce -> (client_id, issued_at)
+_NONCES: dict[str, tuple[str, float]] = {}
+
+
+class CA:
+    """Server certificate authority + verdict signer."""
+
+    def __init__(self):
+        base = os.environ.get("ACHEAT_STATE", _STATE)
+        key_path = os.path.join(base, "ca.key.pem")
+        cert_path = os.path.join(base, "ca.cert.pem")
+        self.key = keys.load_or_create(key_path)
+        if os.path.exists(cert_path):
+            with open(cert_path, encoding="ascii") as fh:
+                self.cert = pki.cert_from_pem(fh.read())
+        else:
+            self.cert = pki.create_ca("acheat-root-CA", self.key)
+            with open(cert_path, "w", encoding="ascii") as fh:
+                fh.write(pki.cert_to_pem(self.cert))
+
+    def issue(self, csr_pem: str) -> str:
+        csr = pki.csr_from_pem(csr_pem)
+        return pki.cert_to_pem(pki.issue_cert(self.key, self.cert, csr))
+
+    def ca_pem(self) -> str:
+        return pki.cert_to_pem(self.cert)
+
+    def sign_verdict(self, verdict: Verdict) -> dict:
+        obj = verdict.to_dict()
+        sig = self.key.sign(canonical_bytes(obj), ec.ECDSA(hashes.SHA256()))
+        return {"verdict_obj": obj, "verdict_sig": base64.b64encode(sig).decode("ascii")}
+
+
+_CA: CA | None = None
+
+
+def _ca() -> CA:
+    global _CA
+    if _CA is None:
+        _CA = CA()
+    return _CA
 
 
 def _issue_nonce(client_id: str) -> str:
@@ -36,7 +83,6 @@ def _issue_nonce(client_id: str) -> str:
 
 
 def _consume_nonce(nonce: str, client_id: str) -> bool:
-    """Single-use + fresh + bound to the same client. Pops on use."""
     entry = _NONCES.pop(nonce, None)
     if entry is None:
         return False
@@ -45,7 +91,7 @@ def _consume_nonce(nonce: str, client_id: str) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # quieter test output
+    def log_message(self, *args):
         pass
 
     def _read_json(self) -> dict:
@@ -64,12 +110,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if self.path == "/enroll":
-                cid, pem = payload["client_id"], payload["pubkey_pem"]
-                # TOFU: first key wins; a changed key on an existing client is refused.
-                if cid in _ENROLLED and _ENROLLED[cid] != pem:
-                    return self._send({"ok": False, "error": "key change refused"}, 409)
-                _ENROLLED.setdefault(cid, pem)
-                return self._send({"ok": True})
+                cert_pem = _ca().issue(payload["csr_pem"])
+                return self._send({"cert_pem": cert_pem, "ca_pem": _ca().ca_pem()})
 
             if self.path == "/nonce":
                 cid = payload["client_id"]
@@ -77,13 +119,13 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/attest":
                 report = payload["report"]
-                signature = payload["signature"]
                 cid = report["client_id"]
                 nonce_ok = _consume_nonce(report.get("nonce", ""), cid)
-                result = verifier.verify(
-                    report, signature, _ENROLLED.get(cid), nonce_ok
+                verdict = verifier.verify(
+                    report, payload["signature"], payload.get("cert_pem"),
+                    _ca().cert, nonce_ok,
                 )
-                return self._send(result.to_dict())
+                return self._send(_ca().sign_verdict(verdict))
 
             self._send({"error": "unknown endpoint"}, 404)
         except Exception as exc:  # noqa: BLE001
@@ -91,8 +133,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8787):
+    _ca()  # initialize CA up front
     httpd = ThreadingHTTPServer((host, port), Handler)
-    print(f"anti-cheat server listening on http://{host}:{port}")
+    print(f"anti-cheat server (CA + attestation) on http://{host}:{port}")
     httpd.serve_forever()
 
 

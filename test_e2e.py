@@ -31,8 +31,7 @@ def start_server() -> ThreadingHTTPServer:
 
 
 def run_client(scenario: str, client_id: str) -> int:
-    # Each client gets its own identity key so enrollments are independent.
-    os.environ["ACHEAT_KEY_PATH"] = os.path.join(HERE, "state", f"{client_id}.pem")
+    # Each client gets its own per-client key/cert (default paths keyed by id).
     with open(os.path.join(HERE, "scenarios", scenario), encoding="utf-8") as fh:
         sim = json.load(fh)
     return agent.run(BASE, client_id, sim)

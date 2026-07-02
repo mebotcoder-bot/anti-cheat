@@ -23,9 +23,9 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from protocol import Report  # noqa: E402
+from protocol import Report, canonical_bytes  # noqa: E402
 from client import collectors  # noqa: E402
-from client.attest import get_identity  # noqa: E402
+from client.attest import Identity  # noqa: E402
 
 
 def _post(url: str, payload: dict) -> dict:
@@ -36,40 +36,52 @@ def _post(url: str, payload: dict) -> dict:
 
 
 def run(server: str, client_id: str, sim: dict | None) -> int:
-    ident = get_identity()
+    ident = Identity(client_id)
     sim = sim or {}
 
-    # 1. Enroll (idempotent server-side; TOFU).
-    _post(f"{server}/enroll", {"client_id": client_id, "pubkey_pem": ident.public_pem()})
+    # 1. Enroll: send a CSR, receive an X.509 client cert + the CA cert.
+    enroll = _post(f"{server}/enroll", {"client_id": client_id, "csr_pem": ident.csr_pem()})
+    ident.store_cert(enroll["cert_pem"], enroll["ca_pem"])
 
     # 2. Fresh nonce.
     nonce = _post(f"{server}/nonce", {"client_id": client_id})["nonce"]
 
-    # 3. Collect signals + quote bound to the nonce. A scenario file may overlay
-    #    kernel/signals so real Ubuntu machines can be simulated off-target.
+    # 3. Collect signals + a TPM quote over the boot PCRs bound to the nonce.
+    #    A scenario file may overlay kernel/signals and pick a PCR profile so
+    #    real Ubuntu boot states can be simulated off-target.
     kernel = collectors.collect_kernel()
     kernel.update(sim.get("kernel", {}))
+    pcr_profile = sim.get("tpm", {}).get("pcr_profile", "good")
     report = Report(
         client_id=client_id,
         nonce=nonce,
         timestamp=time.time(),
         kernel=kernel,
         signals=collectors.collect_all(sim=sim.get("signals")),
-        tpm=ident.quote(nonce),
+        tpm=ident.quote(nonce, pcr_profile),
     )
 
-    # 4. Sign the canonical report and submit.
+    # 4. Sign the canonical report; submit report + cert.
     signature = base64.b64encode(ident.sign(report.signing_bytes())).decode("ascii")
-    result = _post(f"{server}/attest", {"report": report.to_dict(), "signature": signature})
+    result = _post(f"{server}/attest", {
+        "report": report.to_dict(),
+        "signature": signature,
+        "cert_pem": ident.cert_pem,
+    })
 
-    # 5. Report verdict.
-    verdict = result["verdict"]
+    # 5. Authenticate the server's signed verdict, then report it.
+    verdict_obj = result["verdict_obj"]
+    verdict_sig = base64.b64decode(result["verdict_sig"])
+    if not ident.verify_server_sig(canonical_bytes(verdict_obj), verdict_sig):
+        print("\033[31m[SECURITY] server verdict signature INVALID — discarding\033[0m")
+        return 2
+    verdict = verdict_obj["verdict"]
     color = {"PASS": "\033[32m", "FLAG": "\033[33m", "FAIL": "\033[31m"}.get(verdict, "")
     print("=" * 60)
-    print(f" client   : {client_id}   (attestation: {ident.mode})")
+    print(f" client   : {client_id}   (attestation: {ident.mode}, cert-verified)")
     print(f" kernel   : {report.kernel.get('release')}")
-    print(f" verdict  : {color}{verdict}\033[0m   score={result['score']}/100")
-    for reason in result["reasons"]:
+    print(f" verdict  : {color}{verdict}\033[0m   score={verdict_obj['score']}/100  (server-signed)")
+    for reason in verdict_obj["reasons"]:
         print(f"    - {reason}")
     print("=" * 60)
     return 0 if verdict == "PASS" else 1

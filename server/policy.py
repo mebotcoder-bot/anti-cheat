@@ -22,11 +22,16 @@ BANNED_MODULES = {
     "kvm_cheat",
 }
 
-# Known-good TPM PCR digests (sha256) for measured boot. Empty here because they
-# are image-specific; populate from a reference machine with tpm2_pcrread.
-KNOWN_GOOD_PCRS: dict[str, str] = {
-    # "0": "<sha256 hex>", "4": "<sha256 hex>", "7": "<sha256 hex>",
-}
+# Known-good TPM PCR digests (sha256) for measured boot. In production these come
+# from a reference image via `tpm2_pcrread`; here they are the deterministic demo
+# profile so the verifier's real quote-checking path can be exercised.
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from crypto.pcrs import known_good_hex as _known_good_hex  # noqa: E402
+
+KNOWN_GOOD_PCRS: dict[str, str] = _known_good_hex()
 
 # Scoring weights: each failed check subtracts from a starting score of 100.
 WEIGHTS = {
@@ -42,6 +47,7 @@ WEIGHTS = {
     "ld_preload": 30,
     "debugger": 35,
     "no_tpm": 15,               # software attestation is weaker, not fatal
+    "tpm_pcr_policy": 50,       # PCRs differ from known-good boot (bad boot state)
 }
 
 # Verdict thresholds on the final score.

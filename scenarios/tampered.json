@@ -1,5 +1,6 @@
 {
   "_desc": "Cheating box: custom kernel, tainted, Secure Boot off, injected .so, cheat driver, debugger attached.",
+  "tpm": {"pcr_profile": "bad_secureboot"},
   "kernel": {
     "release": "6.8.0-45-cheat",
     "base_version": "6.8.0",

@@ -1,5 +1,6 @@
 {
   "_desc": "Clean Ubuntu box one ABI ahead (6.8.0-48) - exercises the >= rule.",
+  "tpm": {"pcr_profile": "good"},
   "kernel": {
     "release": "6.8.0-48-generic",
     "base_version": "6.8.0",

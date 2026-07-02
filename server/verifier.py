@@ -2,9 +2,10 @@
 """
 Attestation verifier — the authoritative trust decision.
 
-Order matters: cryptographic gates first (signature, nonce, enrollment). If the
-report is not a fresh, authentic statement from an enrolled client, nothing else
-is worth evaluating and we hard-fail. Only then do we score the integrity signals.
+Gate order (fail-closed): a report is only worth scoring if it is a fresh,
+authentic statement from a certificate the server's CA issued, carrying a valid
+TPM quote of a known-good boot. Cryptographic failures hard-fail immediately;
+only then are the integrity signals scored.
 """
 from __future__ import annotations
 
@@ -13,24 +14,19 @@ import os
 import sys
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509 import Certificate
+from cryptography.x509.oid import NameOID
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from protocol import Report, Verdict, canonical_bytes  # noqa: E402
 from server import policy  # noqa: E402
+from crypto import pki  # noqa: E402
+from crypto.tpm_verify import verify_quote  # noqa: E402
 
 
-def _verify_signature(pubkey_pem: str, data: bytes, signature_b64: str) -> bool:
-    try:
-        pub = serialization.load_pem_public_key(pubkey_pem.encode("ascii"))
-        pub.verify(base64.b64decode(signature_b64), data, ec.ECDSA(hashes.SHA256()))
-        return True
-    except (InvalidSignature, ValueError):
-        return False
-
-
-def _kernel_tuple(kernel: dict) -> tuple[int, int, int, int] | None:
+def _kernel_tuple(kernel: dict):
     try:
         maj, minr, mic = (int(x) for x in kernel["base_version"].split("."))
         return (maj, minr, mic, int(kernel["abi"]))
@@ -38,40 +34,61 @@ def _kernel_tuple(kernel: dict) -> tuple[int, int, int, int] | None:
         return None
 
 
-def verify(report_dict: dict, signature_b64: str, enrolled_pubkey: str | None,
-           nonce_ok: bool) -> Verdict:
+def verify(report_dict: dict, signature_b64: str, cert_pem: str | None,
+           ca_cert: Certificate, nonce_ok: bool) -> Verdict:
     report = Report.from_dict(report_dict)
-    score = 100
     reasons: list[str] = []
 
-    # --- Cryptographic gates (any failure = hard fail) -------------------------
-    if enrolled_pubkey is None:
-        return Verdict("FAIL", 0, ["client is not enrolled"])
+    # --- Cryptographic gates (hard fail) --------------------------------------
+    if not cert_pem:
+        return Verdict("FAIL", 0, ["no client certificate presented"])
+    try:
+        cert = pki.cert_from_pem(cert_pem)
+    except ValueError:
+        return Verdict("FAIL", 0, ["client certificate unparseable"])
+
+    if not pki.verify_chain(cert, ca_cert):
+        return Verdict("FAIL", 0, ["client certificate does not chain to CA / expired"])
+
+    cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    if cn != report.client_id:
+        return Verdict("FAIL", 0, [f"cert CN {cn!r} != client_id {report.client_id!r}"])
 
     if not nonce_ok:
         return Verdict("FAIL", 0, ["nonce invalid, expired, or replayed"])
 
-    if not _verify_signature(enrolled_pubkey, canonical_bytes(report.to_dict()), signature_b64):
+    pub = cert.public_key()
+    try:
+        pub.verify(base64.b64decode(signature_b64),
+                   canonical_bytes(report.to_dict()), ec.ECDSA(hashes.SHA256()))
+    except (InvalidSignature, ValueError):
         return Verdict("FAIL", 0, ["report signature does not verify"])
 
-    reasons.append("signature + nonce verified (authentic, fresh)")
+    reasons.append("cert chain + report signature + nonce verified")
 
-    # --- TPM strength ----------------------------------------------------------
-    tpm_mode = report.tpm.get("mode")
-    if tpm_mode == "tpm":
-        # Production: verify the quote signature and PCR digests here against
-        # policy.KNOWN_GOOD_PCRS. (Requires the enrolled AK + reference PCRs.)
-        reasons.append("TPM quote present (hardware-rooted)")
+    score = 100
+
+    # --- TPM quote ------------------------------------------------------------
+    tpm = report.tpm
+    if tpm.get("mode") == "tpm":
+        ok, qreasons = verify_quote(pub, tpm, report.nonce, policy.KNOWN_GOOD_PCRS)
+        if ok:
+            reasons.append(qreasons[-1])
+        elif any("known-good" in r for r in qreasons):
+            score -= policy.WEIGHTS["tpm_pcr_policy"]
+            reasons.append(f"{qreasons[-1]} -{policy.WEIGHTS['tpm_pcr_policy']}")
+        else:
+            # signature / magic / nonce failure inside the quote == forgery
+            return Verdict("FAIL", 0, [f"TPM quote invalid: {qreasons[-1]}"])
     else:
         score -= policy.WEIGHTS["no_tpm"]
-        reasons.append("software attestation only (no TPM) -15")
+        reasons.append(f"no TPM quote (software attestation) -{policy.WEIGHTS['no_tpm']}")
 
     # --- Kernel flavour + version ---------------------------------------------
     kernel = report.kernel
     if kernel.get("flavour_official") is False:
         score -= policy.WEIGHTS["kernel_flavour"]
         reasons.append(f"non-official kernel flavour {kernel.get('flavour')!r} -40")
-
     kt = _kernel_tuple(kernel)
     if kt is not None and kt < policy.MIN_KERNEL:
         score -= policy.WEIGHTS["kernel_version"]
@@ -80,10 +97,10 @@ def verify(report_dict: dict, signature_b64: str, enrolled_pubkey: str | None,
     # --- Integrity signals -----------------------------------------------------
     sig = report.signals
 
-    taint = sig.get("taint", {})
-    if taint.get("available") and not taint.get("clean", True):
+    t = sig.get("taint", {})
+    if t.get("available") and not t.get("clean", True):
         score -= policy.WEIGHTS["taint"]
-        reasons.append(f"kernel tainted (mask={taint.get('value')}) -25")
+        reasons.append(f"kernel tainted (mask={t.get('value')}) -25")
 
     sb = sig.get("secure_boot", {})
     if sb.get("available") and sb.get("enabled") is False:
@@ -119,5 +136,4 @@ def verify(report_dict: dict, signature_b64: str, enrolled_pubkey: str | None,
         verdict = "FLAG"
     else:
         verdict = "FAIL"
-
     return Verdict(verdict, score, reasons)

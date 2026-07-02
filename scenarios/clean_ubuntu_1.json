@@ -1,5 +1,6 @@
 {
   "_desc": "Clean Ubuntu box on the official kernel, Secure Boot on, no tamper.",
+  "tpm": {"pcr_profile": "good"},
   "kernel": {
     "release": "6.8.0-45-generic",
     "base_version": "6.8.0",
